@@ -15,8 +15,9 @@ export Semaphore, semaphore.`==`, semaphore.`<`, semaphore.hash
 export Event
 
 const
-  cpsPoolSize {.intdefine, used.} = 64    ## expected pending continuations
-  cpsTraceSize {.intdefine, used.} = 1000 ## limit the traceback
+  eqDebug {.booldefine, used.} = false   ## emit extra debugging output
+  eqPoolSize {.intdefine, used.} = 64    ## expected pending continuations
+  eqTraceSize {.intdefine, used.} = 1000 ## limit the traceback
 
 type
   State = enum
@@ -48,7 +49,7 @@ type
 
   Cont* = ref object of RootObj
     fn*: proc(c: Cont): Cont {.nimcall.}
-    when cpsDebug:
+    when eqDebug:
       clock: Clock                  ## time of latest poll loop
       delay: Duration               ## polling overhead
       id: Id                        ## our last registration
@@ -92,8 +93,8 @@ proc `==`(a, b: Id): bool {.borrow, used.}
 proc `==`(a, b: Fd): bool {.borrow, used.}
 
 proc put(w: var WaitingIds; fd: int | Fd; id: Id) =
-  while fd.int > len(w):
-    setLen(w, len(w) * 2)
+  while fd.int >= w.len:
+    setLen(w, w.len * 2)
   system.`[]=`(w, fd.int, id)
   case id
   of wakeupId, invalidId:             # don't count invalid ids
@@ -125,8 +126,8 @@ proc init() {.inline.} =
     eq.waiters = 0
 
     # make sure we have a decent amount of space for registrations
-    if len(eq.waiting) < cpsPoolSize:
-      eq.waiting = newSeq[Id](cpsPoolSize).WaitingIds
+    if len(eq.waiting) < eqPoolSize:
+      eq.waiting = newSeq[Id](eqPoolSize).WaitingIds
 
     # the manager wakes up when triggered to do so
     registerEvent(eq.manager, eq.wake, now())
@@ -206,7 +207,7 @@ proc add(eq: var EventQueue; cont: Cont): Id =
   ## Add a continuation to the queue; returns a registration.
   result = nextId()
   eq[result] = cont
-  when cpsDebug:
+  when eqDebug:
     echo "🤞queue ", $result, " now ", len(eq), " items"
 
 proc stop*() =
@@ -230,7 +231,7 @@ proc stop*() =
     close(eq.selector)
 
     # discard the contents of the semaphore cache
-    eq.pending = initTable[Semaphore, Id](cpsPoolSize)
+    eq.pending = initTable[Semaphore, Id](eqPoolSize)
 
     # discard the contents of the continuation cache
     eq.goto = initTable[Id, Cont]()
@@ -255,8 +256,8 @@ when cpsTrace:
 
   proc addFrame(stack: var Stack; c: Cont) =
     stack.addLast Frame(c: c)
-    while len(stack) > cpsTraceSize:
-      popFirst(stack)
+    while stack.len > eqTraceSize:
+      popFirst stack
 
   proc formatDuration*(d: Duration): string =
     ## format a duration to a nice string
@@ -273,25 +274,25 @@ when cpsTrace:
 
   proc `$`(f: Frame): string =
     result = $f.c
-    when cpsDebug:
-      let (i, took) = ("", formatDuration(f.c.delay))
+    when eqDebug:
+      let took = formatDuration(f.c.delay)
       result.add "\n"
       result.add took.align(20) & " delay"
 
   proc writeStackTrace*(stack: Stack) =
-    if len(stack) == 0:
+    if stack.len == 0:
       writeLine(stderr, "no stack recorded")
     else:
       writeLine(stderr, "noroutine stack: (most recent call last)")
-      when cpsDebug:
+      when eqDebug:
         var prior = stack[0].c.clock
-      for i, frame in pairs(stack):
-        when cpsDebug:
+        for i, frame in stack.pairs:
           let took = formatDuration(frame.c.clock - prior)
           prior = frame.c.clock
           writeLine(stderr, $frame)
           writeLine(stderr, took.align(20) & " total")
-        else:
+      else:
+        for frame in stack.items:
           writeLine(stderr, $frame)
 
 else:
@@ -304,9 +305,9 @@ proc trampoline*(c: Cont) =
   ## Run the supplied continuation until it is complete.
   var c = c
   when cpsTrace:
-    var stack = initDeque[Frame](cpsTraceSize)
+    var stack = initDeque[Frame](eqTraceSize)
   while not c.isNil and not c.fn.isNil:
-    when cpsDebug:
+    when eqDebug:
       echo "🎪tramp ", c, " at ", c.clock
     try:
       c = c.fn(c)
@@ -315,7 +316,7 @@ proc trampoline*(c: Cont) =
           addFrame(stack, c)
     except CatchableError:
       when cpsTrace:
-        writeStackTrace(stack)
+        writeStackTrace stack
       raise
 
 proc poll*() =
@@ -323,12 +324,12 @@ proc poll*() =
   if eq.state != Running: return
 
   if eq.waiters > 0:
-    when cpsDebug:
+    when eqDebug:
       let clock = now()
 
     # ready holds the ready file descriptors and their events.
     let ready = select(eq.selector, -1)
-    for event in items(ready):
+    for event in ready.items:
       # get the registration of the pending continuation
       let id = eq.waiting.get(event.fd)
       # pity the fool that removed this assert due to ioselectors spam
@@ -342,7 +343,7 @@ proc poll*() =
         unregister(eq.selector, event.fd)
         var cont: Cont
         if take(eq.goto, id, cont):
-          when cpsDebug:
+          when eqDebug:
             cont.clock = clock
             cont.delay = now() - clock
             cont.id = id
@@ -365,14 +366,14 @@ proc poll*() =
       # then we'll stop the dispatcher now.
       stop()
     else:
-      when cpsDebug:
+      when eqDebug:
         echo "💈"
       # else wait until the next polling interval or signal
       for ready in eq.manager.select(-1):
         # if we get any kind of error, all we can reasonably do is stop
         if ready.errorCode.int != 0:
           stop()
-          raiseOSError(ready.errorCode, "cps eventqueue error")
+          raiseOSError(ready.errorCode, "eventqueue error")
         break
 
 proc run*(interval: Duration = DurationZero) =
@@ -410,7 +411,7 @@ proc sleep*(c: Cont; interval: Duration): Cont {.cpsMagic.} =
         timeout = interval.inMilliseconds.int,
         oneshot = true, data = id)
       eq.waiting.put(fd, id)
-      when cpsDebug:
+      when eqDebug:
         echo "⏰timer ", fd.Fd
 
 proc sleep*(c: Cont; ms: int): Cont {.cpsMagic.} =
@@ -422,7 +423,7 @@ proc sleep*(c: Cont; secs: float): Cont {.cpsMagic.} =
   ## Sleep for `secs` seconds before continuing.
   sleep(c, (1_000 * secs).int)
 
-proc discart*(c: Cont): Cont {.cpsMagic.} =
+proc dismiss*(c: Cont): Cont {.cpsMagic.} =
   ## Discard the current continuation.
   discard
 
@@ -490,7 +491,8 @@ proc spawn*(c: Cont) =
   wakeAfter:
     addLast(eq.yields, c)
 
-proc io*(c: Cont; file: int | SocketHandle; events: set[Event]): Cont {.cpsMagic.} =
+proc iowait*(c: Cont; file: int | SocketHandle;
+             events: set[Event]): Cont {.cpsMagic.} =
   ## Continue upon any of `events` on the given file-descriptor or
   ## SocketHandle.
   if len(events) == 0:
@@ -500,5 +502,5 @@ proc io*(c: Cont; file: int | SocketHandle; events: set[Event]): Cont {.cpsMagic
       let id = eq.add(c)
       registerHandle(eq.selector, file, events = events, data = id)
       eq.waiting.put(file.int, id)
-      when cpsDebug:
+      when eqDebug:
         echo "📂file ", $Fd(file)

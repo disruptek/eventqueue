@@ -1,7 +1,7 @@
 import balls
 
 import cps
-import cps/eventqueue except trampoline
+import eventqueue except trampoline
 
 type
   InfiniteLoop = CatchableError
