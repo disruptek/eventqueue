@@ -1,4 +1,4 @@
-version = "0.0.2"
+version = "0.0.3"
 author = "disruptek"
 description = "async i/o dispatcher for cps"
 license = "MIT"
@@ -16,5 +16,5 @@ task test, "run tests for ci":
     exec findExe"balls"
 
 task demo, "generate the demos":
-  exec """demo docs/tock.svg "nim c -d:danger -d:cpsDebug --out=\$1 tests/tock.nim""""
-  exec """demo docs/teventqueue.svg "nim c --out=\$1 tests/test.nim""""
+  exec """demo docs/tock.svg "nim c -d:danger -d:cpsDebug --gc:arc --out=\$1 tests/tock.nim""""
+  exec """demo docs/teventqueue.svg "nim c --gc:arc --out=\$1 tests/test.nim""""

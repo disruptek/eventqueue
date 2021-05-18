@@ -49,7 +49,7 @@ suite "eventqueue ball pit":
     r = 0
     proc foo() {.cps: Cont.} =
       inc r
-      jield()
+      pass()
       inc r
     trampoline foo()
     check r == 1
@@ -104,7 +104,7 @@ suite "eventqueue ball pit":
 
   block:
     ## the sluggish yield test
-    skip"low priority, since jield works fine"
+    skip"low priority, since pass works fine"
     when defined(release):
       skip"too slow for release mode"
     const
@@ -117,18 +117,18 @@ suite "eventqueue ball pit":
       while count < big and count > tiny:
         inc count
         sleep(ms)
-        jield()
-        jield()
-        jield()
-        jield()
-        jield()
-        jield()
+        pass()
+        pass()
+        pass()
+        pass()
+        pass()
+        pass()
 
     proc lower(ms: int) {.cps: Cont.} =
       while count < big and count > tiny:
         dec count
         sleep(ms)
-        jield()
+        pass()
 
     spawn higher(1)
     spawn lower(1)

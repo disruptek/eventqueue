@@ -20,7 +20,7 @@ const
   eqTraceSize {.intdefine, used.} = 1000 ## limit the traceback
 
 type
-  State = enum
+  Readiness = enum
     Unready = "the default state, pre-initialized"
     Stopped = "we are outside an event loop but available for queuing events"
     Running = "we're in a loop polling for events and running continuations"
@@ -34,7 +34,7 @@ type
   PendingIds = Table[Semaphore, Id]
 
   EventQueue = object
-    state: State                  ## dispatcher readiness
+    state: Readiness              ## dispatcher readiness
     pending: PendingIds           ## maps pending semaphores to Ids
     waiting: WaitingIds           ## maps waiting selector Fds to Ids
     goto: Table[Id, Cont]         ## where to go from here!
@@ -198,8 +198,7 @@ proc `[]=`(eq: var EventQueue; id: Id; cont: Cont) =
   ## put a continuation into the queue according to its registration
   assert id != invalidId
   assert id != wakeupId
-  assert not cont.isNil
-  assert not cont.fn.isNil
+  assert cont.state == State.Running
   assert id notin eq.goto
   eq.goto[id] = cont
 
@@ -248,18 +247,19 @@ when cpsTrace:
 
   proc init*(c: Cont; identity: static[string];
              file: static[string]; row, col: static[int]): Cont =
-    result = init(c)
+    result = init c
     result.identity = identity
     result.filename = file
     result.line = row
     result.column = col
 
   proc addFrame(stack: var Stack; c: Cont) =
-    while stack.len >= eqTraceSize:
-      popFirst stack
-    stack.addLast Frame(c: c)
+    if c.state != Dismissed:
+      while stack.len >= eqTraceSize:
+        popFirst stack
+      stack.addLast Frame(c: c)
 
-  proc formatDuration*(d: Duration): string =
+  proc formatDuration(d: Duration): string =
     ## format a duration to a nice string
     let
       n = d.inNanoseconds
@@ -279,7 +279,7 @@ when cpsTrace:
       result.add "\n"
       result.add took.align(20) & " delay"
 
-  proc writeStackTrace*(stack: Stack) =
+  proc writeStackTrace(stack: Stack) =
     if stack.len == 0:
       writeLine(stderr, "no stack recorded")
     else:
@@ -296,9 +296,8 @@ when cpsTrace:
           writeLine(stderr, $frame)
 
 else:
-  proc writeStackTrace*(c: Cont): Cont =
-    when declaredInScope(result):
-      result = c
+  proc writeStackTrace(c: Cont): Cont =
+    result = c
     warning "--define:cpsTrace:on to output traces"
 
 proc trampoline*(c: Cont) =
@@ -306,14 +305,13 @@ proc trampoline*(c: Cont) =
   var c = c
   when cpsTrace:
     var stack = initDeque[Frame](eqTraceSize)
-  while not c.isNil and not c.fn.isNil:
+  while c.state == State.Running:
     when eqDebug:
       echo "🎪tramp ", c, " at ", c.clock
     try:
       c = c.fn(c)
       when cpsTrace:
-        if not c.isNil:
-          addFrame(stack, c)
+        addFrame(stack, c)
     except CatchableError:
       when cpsTrace:
         writeStackTrace stack
@@ -395,10 +393,14 @@ proc run*(interval: Duration = DurationZero) =
   while eq.state == Running:
     poll()
 
-proc jield*(c: Cont): Cont {.cpsMagic.} =
-  ## Yield to pending continuations in the dispatcher before continuing.
+proc pass*(c: Cont): Cont {.cpsMagic.} =
+  ## Pass control to other pending continuations in the dispatcher before
+  ## continuing; effectively a cooperative yield.
   wakeAfter:
     addLast(eq.yields, c)
+
+proc jield*(c: Cont): Cont {.cpsMagic, deprecated: "renamed to pass()".} =
+  pass c
 
 proc sleep*(c: Cont; interval: Duration): Cont {.cpsMagic.} =
   ## Sleep for `interval` before continuing.
