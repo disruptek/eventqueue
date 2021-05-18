@@ -255,9 +255,9 @@ when cpsTrace:
     result.column = col
 
   proc addFrame(stack: var Stack; c: Cont) =
-    stack.addLast Frame(c: c)
-    while stack.len > eqTraceSize:
+    while stack.len >= eqTraceSize:
       popFirst stack
+    stack.addLast Frame(c: c)
 
   proc formatDuration*(d: Duration): string =
     ## format a duration to a nice string
