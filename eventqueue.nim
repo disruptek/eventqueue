@@ -123,6 +123,7 @@ proc init() {.inline.} =
     eq.timer = invalidFd
     eq.manager = newSelector[Clock]()
     eq.wake = newSelectEvent()
+    eq.eager = false
     eq.selector = newSelector[Id]()
     eq.waiters = 0
 
