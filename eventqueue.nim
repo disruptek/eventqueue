@@ -46,6 +46,7 @@ type
     manager: Selector[Clock]      ## monitor polling, wake-ups
     timer: Fd                     ## file-descriptor of polling timer
     wake: SelectEvent             ## wake-up event for queue actions
+    eager: bool                   ## debounce wake-up triggers
 
   Cont* = ref object of RootObj
     fn*: proc(c: Cont): Cont {.nimcall.}
@@ -170,7 +171,9 @@ proc wakeUp() =
   of Stopped:
     discard "ignored wake-up to stopped dispatcher"
   of Running:
-    trigger eq.wake
+    if not eq.eager:
+      trigger eq.wake
+      eq.eager = true
   of Stopping:
     discard "ignored wake-up request; dispatcher is stopping"
 
@@ -321,6 +324,8 @@ proc poll*() =
   ## See what continuations need running and run them.
   if eq.state != Running: return
 
+  eq.eager = false    # make sure we can trigger again
+
   if eq.waiters > 0:
     when eqDebug:
       let clock = now()
@@ -393,14 +398,14 @@ proc run*(interval: Duration = DurationZero) =
   while eq.state == Running:
     poll()
 
-proc pass*(c: Cont): Cont {.cpsMagic.} =
+proc coop*(c: Cont): Cont {.cpsMagic.} =
   ## Pass control to other pending continuations in the dispatcher before
   ## continuing; effectively a cooperative yield.
   wakeAfter:
     addLast(eq.yields, c)
 
-proc jield*(c: Cont): Cont {.cpsMagic, deprecated: "renamed to pass()".} =
-  pass c
+proc jield*(c: Cont): Cont {.cpsMagic, deprecated: "renamed to coop()".} =
+  coop c
 
 proc sleep*(c: Cont; interval: Duration): Cont {.cpsMagic.} =
   ## Sleep for `interval` before continuing.
