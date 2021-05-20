@@ -27,33 +27,30 @@ type
     Stopping = "we're tearing down the dispatcher and it will shortly stop"
 
   Clock = MonoTime
-  Id = distinct int
+  Id = distinct int  ## semaphore registration
   Fd = distinct int
 
-  WaitingIds = seq[Id]
-  PendingIds = Table[Semaphore, Id]
+  Waiting = seq[Cont]
+  Pending = Table[Semaphore, Cont]
 
   EventQueue = object
     state: Readiness              ## dispatcher readiness
-    pending: PendingIds           ## maps pending semaphores to Ids
-    waiting: WaitingIds           ## maps waiting selector Fds to Ids
-    goto: Table[Id, Cont]         ## where to go from here!
     lastId: Id                    ## id of last-issued registration
-    selector: Selector[Id]        ## watches selectable stuff
+    pending: Pending              ## maps pending semaphores to Conts
+    waiting: Waiting              ## maps waiting selector Fds to Conts
+    selector: Selector[Cont]      ## watches selectable stuff
     yields: Deque[Cont]           ## continuations ready to run
     waiters: int                  ## a count of selector listeners
 
     manager: Selector[Clock]      ## monitor polling, wake-ups
     timer: Fd                     ## file-descriptor of polling timer
     wake: SelectEvent             ## wake-up event for queue actions
-    eager: bool                   ## debounce wake-up triggers
 
   Cont* = ref object of RootObj
     fn*: proc(c: Cont): Cont {.nimcall.}
     when eqDebug:
       clock: Clock                  ## time of latest poll loop
       delay: Duration               ## polling overhead
-      id: Id                        ## our last registration
       fd: Fd                        ## our last file-descriptor
     when cpsTrace:
       filename: string
@@ -69,7 +66,6 @@ when cpsTrace:
     Stack = Deque[Frame]
 
 const
-  wakeupId = Id(-1)
   invalidId = Id(0)
   invalidFd = Fd(-1)
   oneMs = initDuration(milliseconds = 1)
@@ -93,23 +89,17 @@ proc `<`(a, b: Fd): bool {.borrow, used.}
 proc `==`(a, b: Id): bool {.borrow, used.}
 proc `==`(a, b: Fd): bool {.borrow, used.}
 
-proc put(w: var WaitingIds; fd: int | Fd; id: Id) =
-  while fd.int >= w.len:
-    setLen(w, w.len * 2)
-  system.`[]=`(w, fd.int, id)
-  case id
-  of wakeupId, invalidId:             # don't count invalid ids
-    discard
-  else:
+proc put(w: var Waiting; fd: int | Fd; c: Cont) =
+  if not c.isNil:
+    while fd.int >= w.len:
+      setLen(w, w.len * 2)
+    w[fd.int] = c
     inc eq.waiters
     assert eq.waiters > 0
 
-proc get(w: var WaitingIds; fd: int | Fd): Id =
-  result = w[fd.int]
-  if result != wakeupId:              # don't zap our wakeup id
-    if result != invalidId:           # don't count invalid ids
-      dec eq.waiters
-    w[fd.int] = invalidId
+proc get(w: var Waiting; fd: int | Fd): Cont =
+  swap(result, w[fd.int])
+  dec eq.waiters
 
 method clone(c: Cont): Cont {.base.} =
   ## copy the continuation for the purposes of, eg. fork
@@ -123,26 +113,15 @@ proc init() {.inline.} =
     eq.timer = invalidFd
     eq.manager = newSelector[Clock]()
     eq.wake = newSelectEvent()
-    eq.eager = false
-    eq.selector = newSelector[Id]()
+    eq.selector = newSelector[Cont]()
     eq.waiters = 0
 
     # make sure we have a decent amount of space for registrations
     if len(eq.waiting) < eqPoolSize:
-      eq.waiting = newSeq[Id](eqPoolSize).WaitingIds
+      eq.waiting = newSeq[Cont](eqPoolSize).Waiting
 
     # the manager wakes up when triggered to do so
     registerEvent(eq.manager, eq.wake, now())
-
-    # so does the main selector
-    registerEvent(eq.selector, eq.wake, wakeupId)
-
-    # XXX: this seems to be the only reasonable way to get our wakeup fd
-    # we want to get the fd used for the wakeup event
-    trigger eq.wake
-    for ready in select(eq.selector, -1):
-      assert User in ready.events
-      eq.waiting.put(ready.fd, wakeupId)
 
     eq.lastId = invalidId
     eq.yields = initDeque[Cont]()
@@ -165,18 +144,9 @@ proc newSemaphore*(): Semaphore =
   ## Create a new Semaphore.
   result.init nextId().int
 
-proc wakeUp() =
-  case eq.state
-  of Unready:
+template wakeUp() =
+  if eq.state == Unready:
     init()
-  of Stopped:
-    discard "ignored wake-up to stopped dispatcher"
-  of Running:
-    if not eq.eager:
-      trigger eq.wake
-      eq.eager = true
-  of Stopping:
-    discard "ignored wake-up request; dispatcher is stopping"
 
 template wakeAfter(body: untyped): untyped =
   ## wake up the dispatcher after performing the following block
@@ -188,30 +158,12 @@ template wakeAfter(body: untyped): untyped =
 
 proc len*(eq: EventQueue): int =
   ## The number of pending continuations.
-  result = len(eq.goto) + len(eq.yields) + len(eq.pending)
+  result = len(eq.yields) + len(eq.pending) + eq.waiters
 
-proc `[]=`(eq: var EventQueue; s: var Semaphore; id: Id) =
+proc `[]=`(eq: var EventQueue; s: var Semaphore; c: Cont) =
   ## put a semaphore into the queue with its registration
-  assert id != invalidId
-  assert id != wakeupId
   assert not s.isReady
-  assert s.id.Id != invalidId
-  eq.pending[s] = id
-
-proc `[]=`(eq: var EventQueue; id: Id; cont: Cont) =
-  ## put a continuation into the queue according to its registration
-  assert id != invalidId
-  assert id != wakeupId
-  assert cont.state == State.Running
-  assert id notin eq.goto
-  eq.goto[id] = cont
-
-proc add(eq: var EventQueue; cont: Cont): Id =
-  ## Add a continuation to the queue; returns a registration.
-  result = nextId()
-  eq[result] = cont
-  when eqDebug:
-    echo "🤞queue ", $result, " now ", len(eq), " items"
+  eq.pending[s] = c
 
 proc stop*() =
   ## Tell the dispatcher to stop, discarding all pending continuations.
@@ -221,23 +173,17 @@ proc stop*() =
     # tear down the manager
     assert not eq.manager.isNil
     eq.manager.unregister eq.wake
+    close(eq.wake)
     if eq.timer != invalidFd:
       eq.manager.unregister eq.timer.int
       eq.timer = invalidFd
     close(eq.manager)
 
-    # shutdown the wake-up trigger
-    eq.selector.unregister eq.wake
-    close(eq.wake)
-
     # discard the current selector to dismiss any pending events
     close(eq.selector)
 
     # discard the contents of the semaphore cache
-    eq.pending = initTable[Semaphore, Id](eqPoolSize)
-
-    # discard the contents of the continuation cache
-    eq.goto = initTable[Id, Cont]()
+    eq.pending = initTable[Semaphore, Cont](eqPoolSize)
 
     # re-initialize the queue
     eq.state = Unready
@@ -325,8 +271,6 @@ proc poll*() =
   ## See what continuations need running and run them.
   if eq.state != Running: return
 
-  eq.eager = false    # make sure we can trigger again
-
   if eq.waiters > 0:
     when eqDebug:
       let clock = now()
@@ -334,34 +278,22 @@ proc poll*() =
     # ready holds the ready file descriptors and their events.
     let ready = select(eq.selector, -1)
     for event in ready.items:
-      # get the registration of the pending continuation
-      let id = eq.waiting.get(event.fd)
-      # pity the fool that removed this assert due to ioselectors spam
-      #assert getData(eq.selector, event.fd) == id
-      # the id will be wakeupId if it's a wake-up event
-      assert id != invalidId
-      if id == wakeupId:
-        discard
-      else:
-        # stop listening on this fd
-        unregister(eq.selector, event.fd)
-        var cont: Cont
-        if take(eq.goto, id, cont):
-          when eqDebug:
-            cont.clock = clock
-            cont.delay = now() - clock
-            cont.id = id
-            cont.fd = event.fd.Fd
-            echo "💈delay ", id, " ", cont.delay
-          trampoline cont
-        else:
-          raise newException(KeyError, "missing registration " & $id)
+      # stop listening on this fd
+      unregister(eq.selector, event.fd)
+      # get the pending continuation
+      let cont = eq.waiting.get(event.fd)
+      when eqDebug:
+        cont.clock = clock
+        cont.delay = now() - clock
+        cont.fd = event.fd.Fd
+        echo "💈delay ", cont.delay
+      trampoline cont
 
   if len(eq.yields) > 0:
     # run no more than the current number of ready continuations
     for index in 1 .. len(eq.yields):
-      let cont = popFirst eq.yields
-      trampoline cont
+      trampoline:
+        popFirst eq.yields
 
   # if there are no pending continuations,
   if len(eq) == 0:
@@ -405,20 +337,16 @@ proc coop*(c: Cont): Cont {.cpsMagic.} =
   wakeAfter:
     addLast(eq.yields, c)
 
-proc jield*(c: Cont): Cont {.cpsMagic, deprecated: "renamed to coop()".} =
-  coop c
-
 proc sleep*(c: Cont; interval: Duration): Cont {.cpsMagic.} =
   ## Sleep for `interval` before continuing.
   if interval < oneMs:
     raise newException(ValueError, "intervals < 1ms unsupported")
   else:
     wakeAfter:
-      let id = eq.add(c)
       let fd = registerTimer(eq.selector,
-        timeout = interval.inMilliseconds.int,
-        oneshot = true, data = id)
-      eq.waiting.put(fd, id)
+                             timeout = interval.inMilliseconds.int,
+                             oneshot = true, data = c)
+      eq.waiting.put(fd, c)
       when eqDebug:
         echo "⏰timer ", fd.Fd
 
@@ -441,19 +369,12 @@ proc noop*(c: Cont): Cont {.cpsMagic.} =
 
 template signalImpl(s: Semaphore; body: untyped): untyped =
   ## run the body when when semaphore is NOT found in the queue
-  var trigger = false
-  var id = invalidId
-  try:
-    if take(eq.pending, s, id):
-      var c: Cont
-      if take(eq.goto, id, c):
-        addLast(eq.yields, c)
-        trigger = true
-    else:
-      body
-  finally:
-    if trigger:
-      wakeUp()
+  var c: Cont
+  if take(eq.pending, s, c):
+    wakeUp()
+    addLast(eq.yields, c)
+  else:
+    body
 
 proc signal*(s: var Semaphore) =
   ## Signal the given Semaphore `s`, causing the first waiting continuation
@@ -479,19 +400,17 @@ proc signalAll*(s: var Semaphore) =
 proc wait*(c: Cont; s: var Semaphore): Cont {.cpsMagic.} =
   ## Queue the current continuation pending readiness of the given
   ## Semaphore `s`.
-  let id = nextId()
   if s.isReady:
-    addLast(eq.yields, c)
     wakeUp()
+    addLast(eq.yields, c)
   else:
-    eq[s] = id
-    eq[id] = c
+    eq.pending[s] = c
 
 proc fork*(c: Cont): Cont {.cpsMagic.} =
   ## Duplicate the current continuation.
   result = c
   wakeAfter:
-    addLast(eq.yields, clone(c))
+    addLast(eq.yields, clone c)
 
 proc spawn*(c: Cont) =
   ## Queue the supplied continuation `c`; control remains in the calling
@@ -507,8 +426,7 @@ proc iowait*(c: Cont; file: int | SocketHandle;
     raise newException(ValueError, "no events supplied")
   else:
     wakeAfter:
-      let id = eq.add(c)
-      registerHandle(eq.selector, file, events = events, data = id)
-      eq.waiting.put(file.int, id)
+      registerHandle(eq.selector, file, events = events, data = c)
+      eq.waiting.put(file.int, c)
       when eqDebug:
         echo "📂file ", $Fd(file)
