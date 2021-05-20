@@ -98,7 +98,8 @@ proc put(w: var Waiting; fd: int | Fd; c: Cont) =
     assert eq.waiters > 0
 
 proc get(w: var Waiting; fd: int | Fd): Cont =
-  swap(result, w[fd.int])
+  result = w[fd.int]
+  w[fd.int] = Cont nil
   dec eq.waiters
 
 method clone(c: Cont): Cont {.base.} =
