@@ -1,3 +1,4 @@
+import std/strformat
 import std/strutils
 import std/macros
 import std/os
@@ -46,24 +47,26 @@ type
     timer: Fd                     ## file-descriptor of polling timer
     wake: SelectEvent             ## wake-up event for queue actions
 
+    pool: Table[int, seq[Cont]]   ## recyclable continuations
+
   Cont* = ref object of RootObj
     fn*: proc(c: Cont): Cont {.nimcall.}
     when eqDebug:
       clock: Clock                  ## time of latest poll loop
       delay: Duration               ## polling overhead
       fd: Fd                        ## our last file-descriptor
-    when cpsTrace:
-      filename: string
-      line: int
-      column: int
-      identity: string
 
-when cpsTrace:
-  type
-    Frame = object
-      c: Cont
-      e: ref CatchableError
-    Stack = Deque[Frame]
+  TracingCont* = ref object of RootObj
+    fn*: proc(c: TracingCont): TracingCont {.nimcall.}
+    identity: string
+    filename: string
+    line: int
+    column: int
+
+  Frame = object
+    c: TracingCont
+    e: ref CatchableError
+  Stack = Deque[Frame]
 
 const
   invalidId = Id(0)
@@ -76,13 +79,11 @@ template now(): Clock = getMonoTime()
 
 proc `$`(id: Id): string {.used.} = "{" & system.`$`(id.int) & "}"
 proc `$`(fd: Fd): string {.used.} = "[" & system.`$`(fd.int) & "]"
-proc `$`(c: Cont): string {.used.} =
-  when cpsTrace:
-    # quality poor!
-    #"$1($2) $3" % [ c.filename, $c.line, c.identity ]
-    c.identity
-  else:
-    "&" & $cast[uint](c)
+proc `$`(c: Cont): string {.used.} = "&" & $cast[uint](c)
+proc `$`(c: TracingCont): string {.used.} =
+  # quality poor!
+  #"$1($2) $3" % [ c.filename, $c.line, c.identity ]
+  c.identity
 
 proc `<`(a, b: Id): bool {.borrow, used.}
 proc `<`(a, b: Fd): bool {.borrow, used.}
@@ -168,150 +169,147 @@ proc `[]=`(eq: var EventQueue; s: var Semaphore; c: Cont) =
 
 proc stop*() =
   ## Tell the dispatcher to stop, discarding all pending continuations.
-  if eq.state == Running:
-    eq.state = Stopping
+  if eq.state != Running: return
+  eq.state = Stopping
 
-    # tear down the manager
-    assert not eq.manager.isNil
-    eq.manager.unregister eq.wake
-    close(eq.wake)
-    if eq.timer != invalidFd:
-      eq.manager.unregister eq.timer.int
-      eq.timer = invalidFd
-    close(eq.manager)
+  # tear down the manager
+  assert not eq.manager.isNil
+  eq.manager.unregister eq.wake
+  close(eq.wake)
+  if eq.timer != invalidFd:
+    eq.manager.unregister eq.timer.int
+    eq.timer = invalidFd
+  close(eq.manager)
 
-    # discard the current selector to dismiss any pending events
-    close(eq.selector)
+  # discard the current selector to dismiss any pending events
+  close(eq.selector)
 
-    # discard the contents of the semaphore cache
-    eq.pending = initTable[Semaphore, Cont](eqPoolSize)
+  # discard the contents of the semaphore cache
+  eq.pending = initTable[Semaphore, Cont](eqPoolSize)
 
-    # re-initialize the queue
-    eq.state = Unready
-    init()
+  # re-initialize the queue
+  eq.state = Unready
+  init()
 
-proc init*(c: Cont): Cont =
-  result = c
+proc addFrame(stack: var Stack; c: TracingCont) =
+  if not c.dismissed:
+    while stack.len >= eqTraceSize:
+      popFirst stack
+    stack.addLast Frame(c: c)
 
-when cpsTrace:
-  import std/strformat
+proc formatDuration(d: Duration): string =
+  ## format a duration to a nice string
+  let
+    n = d.inNanoseconds
+    ss = (n div 1_000_000_000) mod 1_000
+    ms = (n div 1_000_000) mod 1_000
+    us = (n div 1_000) mod 1_000
+    ns = (n div 1) mod 1_000
+  try:
+    result = fmt"{ss:>3}s {ms:>3}ms {us:>3}μs {ns:>3}ns"
+  except:
+    result = [$ss, $ms, $us, $ns].join(" ")
 
-  proc init*(c: Cont; identity: static[string];
-             file: static[string]; row, col: static[int]): Cont =
-    result = init c
-    result.identity = identity
-    result.filename = file
-    result.line = row
-    result.column = col
+proc `$`(f: Frame): string =
+  result = $f.c
+  when eqDebug:
+    let took = formatDuration(f.c.delay)
+    result.add "\n"
+    result.add took.align(20) & " delay"
 
-  proc addFrame(stack: var Stack; c: Cont) =
-    if c.state != Dismissed:
-      while stack.len >= eqTraceSize:
-        popFirst stack
-      stack.addLast Frame(c: c)
-
-  proc formatDuration(d: Duration): string =
-    ## format a duration to a nice string
-    let
-      n = d.inNanoseconds
-      ss = (n div 1_000_000_000) mod 1_000
-      ms = (n div 1_000_000) mod 1_000
-      us = (n div 1_000) mod 1_000
-      ns = (n div 1) mod 1_000
-    try:
-      result = fmt"{ss:>3}s {ms:>3}ms {us:>3}μs {ns:>3}ns"
-    except:
-      result = [$ss, $ms, $us, $ns].join(" ")
-
-  proc `$`(f: Frame): string =
-    result = $f.c
+proc writeStackTrace(stack: Stack) =
+  if stack.len == 0:
+    writeLine(stderr, "no stack recorded")
+  else:
+    writeLine(stderr, "noroutine stack: (most recent call last)")
     when eqDebug:
-      let took = formatDuration(f.c.delay)
-      result.add "\n"
-      result.add took.align(20) & " delay"
-
-  proc writeStackTrace(stack: Stack) =
-    if stack.len == 0:
-      writeLine(stderr, "no stack recorded")
+      var prior = stack[0].c.clock
+      for i, frame in stack.pairs:
+        let took = formatDuration(frame.c.clock - prior)
+        prior = frame.c.clock
+        writeLine(stderr, $frame)
+        writeLine(stderr, took.align(20) & " total")
     else:
-      writeLine(stderr, "noroutine stack: (most recent call last)")
-      when eqDebug:
-        var prior = stack[0].c.clock
-        for i, frame in stack.pairs:
-          let took = formatDuration(frame.c.clock - prior)
-          prior = frame.c.clock
-          writeLine(stderr, $frame)
-          writeLine(stderr, took.align(20) & " total")
-      else:
-        for frame in stack.items:
-          writeLine(stderr, $frame)
+      for frame in stack.items:
+        writeLine(stderr, $frame)
 
-else:
-  proc writeStackTrace(c: Cont): Cont =
-    result = c
-    warning "--define:cpsTrace:on to output traces"
+template trampoline*(c: Cont | TracingCont; body: untyped) =
+  var it {.inject.} = c
+  while it.running:
+    body
+    it = it.fn(it)
 
 proc trampoline*(c: Cont) =
+  var it = c
+  while it.running:
+    it = it.fn(it)
+
+proc trampoline*(c: TracingCont) =
   ## Run the supplied continuation until it is complete.
-  var c = c
-  when cpsTrace:
-    var stack = initDeque[Frame](eqTraceSize)
-  while c.state == State.Running:
-    when eqDebug:
-      echo "🎪tramp ", c, " at ", c.clock
-    try:
-      c = c.fn(c)
-      when cpsTrace:
-        addFrame(stack, c)
-    except CatchableError:
-      when cpsTrace:
-        writeStackTrace stack
-      raise
-
-proc poll*() =
-  ## See what continuations need running and run them.
-  if eq.state != Running: return
-
-  if eq.waiters > 0:
-    when eqDebug:
-      let clock = now()
-
-    # ready holds the ready file descriptors and their events.
-    let ready = select(eq.selector, -1)
-    for event in ready.items:
-      # stop listening on this fd
-      unregister(eq.selector, event.fd)
-      # get the pending continuation
-      let cont = eq.waiting.get(event.fd)
+  var stack = initDeque[Frame](eqTraceSize)
+  try:
+    trampoline c:
       when eqDebug:
-        cont.clock = clock
-        cont.delay = now() - clock
-        cont.fd = event.fd.Fd
-        echo "💈delay ", cont.delay
-      trampoline cont
+        echo "🎪tramp ", it, " at ", it.clock
+      addFrame(stack, c)
+  except CatchableError:
+    writeStackTrace stack
+    raise
 
-  if len(eq.yields) > 0:
-    # run no more than the current number of ready continuations
-    for index in 1 .. len(eq.yields):
+template loop() =
+  ## See what continuations need running and run them.
+
+  # thanks for not exporting MAX_EPOLL_EVENTS;
+  const MAX_EPOLL_EVENTS = 64
+
+  # ready holds the ready file descriptors and their events.
+  var ready = newSeq[ReadyKey](MAX_EPOLL_EVENTS)
+  var found: int
+
+  while eq.state == Running:
+
+    # if there is work to be done, let's keep those continuations
+    # in hot cache versus going to the OS for I/O or whatever
+    while len(eq.yields) > 0:
       trampoline:
         popFirst eq.yields
 
-  # if there are no pending continuations,
-  if len(eq) == 0:
-    # and there is no polling timer setup,
-    if eq.timer == invalidFd:
-      # then we'll stop the dispatcher now.
-      stop()
-    else:
+    # now we can think about maybe doing some I/O
+    if eq.waiters > 0:
       when eqDebug:
-        echo "💈"
-      # else wait until the next polling interval or signal
-      for ready in eq.manager.select(-1):
-        # if we get any kind of error, all we can reasonably do is stop
-        if ready.errorCode.int != 0:
-          stop()
-          raiseOSError(ready.errorCode, "eventqueue error")
-        break
+        let clock = now()
+
+      found = selectInto(eq.selector, -1, ready)
+      for event in ready[0 ..< found].items:
+        # stop listening on this fd
+        unregister(eq.selector, event.fd)
+        # get the pending continuation
+        let cont = eq.waiting.get(event.fd)
+        when eqDebug:
+          cont.clock = clock
+          cont.delay = now() - clock
+          cont.fd = event.fd.Fd
+          echo "💈delay ", cont.delay
+        trampoline cont
+
+    # if there are no pending continuations,
+    if len(eq) == 0:
+      # and there is no polling timer setup,
+      if eq.timer == invalidFd:
+        # then we'll stop the dispatcher now.
+        stop()
+      else:
+        # then we'll stop the dispatcher now.
+        when eqDebug:
+          echo "💈"
+        # else wait until the next polling interval or signal
+        found = selectInto(eq.manager, -1, ready)
+        for event in ready[0 ..< found].items:
+          # if we get any kind of error, all we can reasonably do is stop
+          if event.errorCode.int != 0:
+            stop()
+            raiseOSError event.errorCode: "eventqueue error"
+          break
 
 proc run*(interval: Duration = DurationZero) =
   ## The dispatcher runs with a maximal polling interval; an `interval` of
@@ -329,8 +327,7 @@ proc run*(interval: Duration = DurationZero) =
                              oneshot = false, data = now()).Fd
   # the dispatcher is now running
   eq.state = Running
-  while eq.state == Running:
-    poll()
+  loop()
 
 proc coop*(c: Cont): Cont {.cpsMagic.} =
   ## Pass control to other pending continuations in the dispatcher before
@@ -431,3 +428,42 @@ proc iowait*(c: Cont; file: int | SocketHandle;
       eq.waiting.put(file.int, c)
       when eqDebug:
         echo "📂file ", $Fd(file)
+
+proc allocator[T: Cont](C: typedesc[T]; size: int): C =
+  block:
+    let h = size
+    if h in eq.pool:
+      #echo "in pool ", h
+      let s = eq.pool[h]
+      if s.len > 0:
+        #echo "len ", s.len, " ", h
+        result = T eq.pool[h].pop
+        break
+    #echo "new cont ", h
+    new C
+
+when false:
+  macro alloc*[T: Cont](n: typedesc[T]): T =
+    #echo repr(n)
+    #echo treeRepr(getTypeImpl n)
+    let env = getTypeImpl (getTypeImpl n).last
+    let o = env.last
+    result = newStmtList()
+    result.add:
+      newCall(bindSym"allocator", n, newCall(bindSym"sizeof", o))
+
+  proc dealloc*[T: Cont](t: typedesc; c: sink T) =
+    if c.isNil: return
+    let h = sizeof (t(c))[]
+    if h in eq.pool:
+      if eq.pool[h].len < eqPoolSize:
+        #echo "recycle (added) ", h
+        eq.pool[h].add c
+      else:
+        discard
+        #echo "recycle (pool full) ", h
+    else:
+      var s = newSeqOfCap[Cont](eqPoolSize)
+      s.add c
+      eq.pool[h] = move s
+      #echo "recycle (new seq) ", h
