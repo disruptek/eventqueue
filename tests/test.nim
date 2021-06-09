@@ -1,6 +1,6 @@
 import balls
 
-import cps
+import cps except trampoline
 import eventqueue except trampoline
 
 type
@@ -10,35 +10,12 @@ var jumps: int
 
 proc trampoline(c: Cont) =
   jumps = 0
-  var c = c
+  var c: Continuation = c
   while c != nil and c.fn != nil:
     c = c.fn(c)
     inc jumps
     if jumps > 1000:
       raise newException(InfiniteLoop, $jumps & " iterations")
-
-suite "basic testing assumptions":
-
-  block:
-    ## the trampoline runs continuations, uh, continuously
-    var r = 0
-    proc foo() {.cps: Cont.} =
-      while true:
-        inc r
-        noop()
-    expect InfiniteLoop:
-      trampoline foo()
-    check r > 1
-
-  block:
-    ## noop magic smoke test
-    var r = 0
-    proc foo() {.cps: Cont.} =
-      inc r
-      noop()
-      inc r
-    trampoline foo()
-    check r == 2, "who let the smoke out?"
 
 suite "eventqueue ball pit":
 
@@ -51,7 +28,7 @@ suite "eventqueue ball pit":
       inc r
       coop()
       inc r
-    trampoline foo()
+    trampoline: whelp foo()
     check r == 1
     run()
     check r == 2
@@ -68,7 +45,7 @@ suite "eventqueue ball pit":
         inc r
         inc i
       check i == q
-    spawn foo()
+    spawn: whelp foo()
     run()
     check r == q * 2
 
@@ -85,8 +62,8 @@ suite "eventqueue ball pit":
       wait sem
       success = true
 
-    trampoline signalSleeper(10)
-    trampoline signalWaiter()
+    trampoline: whelp signalSleeper(10)
+    trampoline: whelp signalWaiter()
     run()
     check success, "signal failed"
 
@@ -99,7 +76,7 @@ suite "eventqueue ball pit":
       inc r
       fork()
       inc r
-    trampoline foo()
+    trampoline: whelp foo()
     check r == 3
 
   block:
@@ -130,8 +107,8 @@ suite "eventqueue ball pit":
         sleep(ms)
         coop()
 
-    spawn higher(1)
-    spawn lower(1)
+    spawn: whelp higher(1)
+    spawn: whelp lower(1)
     run()
 
     check count != tiny, "you're a terrible coder"

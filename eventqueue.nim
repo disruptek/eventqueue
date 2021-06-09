@@ -18,6 +18,7 @@ const
   eqDebug {.booldefine, used.} = false   ## emit extra debugging output
   eqPoolSize {.intdefine, used.} = 64    ## expected pending continuations
   eqTraceSize {.intdefine, used.} = 1000 ## limit the traceback
+  cpsTrace = false
 
 type
   Readiness = enum
@@ -48,8 +49,7 @@ type
     wake: SelectEvent             ## wake-up event for queue actions
     eager: bool                   ## debounce wake-up triggers
 
-  Cont* = ref object of RootObj
-    fn*: proc(c: Cont): Cont {.nimcall.}
+  Cont* = ref object of Continuation
     when eqDebug:
       clock: Clock                  ## time of latest poll loop
       delay: Duration               ## polling overhead
@@ -202,7 +202,6 @@ proc `[]=`(eq: var EventQueue; id: Id; cont: Cont) =
   ## put a continuation into the queue according to its registration
   assert id != invalidId
   assert id != wakeupId
-  assert cont.state == State.Running
   assert id notin eq.goto
   eq.goto[id] = cont
 
@@ -306,10 +305,10 @@ else:
 
 proc trampoline*(c: Cont) =
   ## Run the supplied continuation until it is complete.
-  var c = c
+  var c: Continuation = c
   when cpsTrace:
     var stack = initDeque[Frame](eqTraceSize)
-  while c.state == State.Running:
+  while c.running:
     when eqDebug:
       echo "🎪tramp ", c, " at ", c.clock
     try:

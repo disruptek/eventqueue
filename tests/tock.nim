@@ -4,7 +4,7 @@ import cps
 # but each usage of the .cps. macro can have its own dispatcher
 # implementation and continuation type, allowing you to implement
 # custom forms of async or using an existing library implementation
-from eventqueue import sleep, run, spawn, trampoline, Cont
+from eventqueue import sleep, run, spawn, Cont
 
 # this procedure is written in a simple synchronous style, but when
 # the .cps. is applied during compilation, it is rewritten to use
@@ -32,11 +32,11 @@ proc tock(name: string; ms: int) {.cps: Cont.} =
 
 # the trampoline repeatedly invokes continuations until they
 # complete or are queued in the dispatcher; this call does not block
-trampoline tock("tick", ms = 30)
+discard trampoline: whelp tock("tick", ms = 30)
 
 # you can also send a continuation directly to the dispatcher;
 # this call does not block
-spawn tock("tock", ms = 70)
+spawn: whelp tock("tock", ms = 70)
 
 # run the dispatcher to invoke its pending continuations from the queue;
 # this is a blocking call that completes when the queue is empty
